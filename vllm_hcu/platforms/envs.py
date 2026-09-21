@@ -76,6 +76,25 @@ if TYPE_CHECKING:
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
+    # ---- Ported from vllm-hcu-main d095594 / 6059c0a ----
+    VLLM_HCU_USE_CUSTOM_FUSED_GDN : bool = False
+    VLLM_HCU_GDN_MAX_TOKENS : int = 8192
+    VLLM_HCU_GDN_MAX_SEQS : int = 64
+    VLLM_HCU_GDN_MAX_BATCH : int = 1
+    VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM: bool = True
+    VLLM_HCU_USE_FUSED_RMSNORM_MROPE: bool = False
+    VLLM_HCU_USE_QKV_SPLIT_GATE_DEINTERLEAVE : bool = False
+    # Fused gated RMSNorm that consumes the strided [L, num_v, head_v] z view
+    # directly (hcu_rms_norm_gated_strided_z) instead of a contiguous copy.
+    # Requires VLLM_HCU_USE_CUSTOM_OPS.
+    VLLM_HCU_USE_CUSTOM_STRIDED_Z : bool = True
+    # Fused q/k/v split + contiguous for GatedDeltaNet rearrange_mixed_qkv
+    # (hcu_rearrange_mixed_qkv). Requires VLLM_HCU_USE_CUSTOM_OPS.
+    VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV : bool = True
+    # HIP C++ packed decode kernel for GDN non-spec decode
+    # (aiter.aiter_fused_recurrent_gated_delta_rule_packed_decode);
+    # requires VLLM_HCU_USE_CUSTOM_OPS. Set to 0 to fall back to aiter Triton.
+    VLLM_HCU_USE_AITER_PACKED_DECODE: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -472,6 +491,57 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS":
         lambda: (os.environ.get("VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS", "False").lower() in
                     ("true", "1")),
+
+    # ---- Ported from vllm-hcu-main d095594 / 6059c0a ----
+    # Use the custom fused chunk_gated_delta_rule (fused_kkt_solve_wy +
+    # fused_h_o Triton kernels, no intermediate A/h tensors in DRAM) instead of
+    # the wheel's non-fused algorithm. Default off; the fused kernels live in
+    # vllm_hcu.model_executor.layers.fla.ops.
+    "VLLM_HCU_USE_CUSTOM_FUSED_GDN":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_FUSED_GDN", "False").lower() in
+             ("true", "1")),
+    # Capacity of the per-layer ChunkGDRBuffers allocated when
+    # VLLM_HCU_USE_CUSTOM_FUSED_GDN is on.
+    "VLLM_HCU_GDN_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_HCU_GDN_MAX_TOKENS", "8192")),
+    "VLLM_HCU_GDN_MAX_SEQS":
+    lambda: int(os.environ.get("VLLM_HCU_GDN_MAX_SEQS", "64")),
+    "VLLM_HCU_GDN_MAX_BATCH":
+    lambda: int(os.environ.get("VLLM_HCU_GDN_MAX_BATCH", "1")),
+    # If set, vLLM will use DeepGEMM W8A16 GEMM kernel; otherwise falls back to
+    # the PyTorch native implementation.
+    "VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM":
+        lambda: (os.environ.get("VLLM_HCU_USE_DEEPGEMM_W8A16_GEMM", "True").lower() in
+                 ("true", "1")),
+    # If set (default False), use the fused RMSNorm + MRoPE single Triton kernel
+    # for qwen3_next; otherwise fall back to separate q_norm/k_norm + rotary_emb.
+    "VLLM_HCU_USE_FUSED_RMSNORM_MROPE":
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMSNORM_MROPE", "False").lower() in
+                 ("true", "1")),
+    # Replace the Python-level qkv split/view/chunk sequence with the single
+    # Triton kernel qkv_split_gate_deinterleave. Only takes effect when the
+    # model's attn_output_gate is enabled.
+    "VLLM_HCU_USE_QKV_SPLIT_GATE_DEINTERLEAVE":
+        lambda: (os.environ.get("VLLM_HCU_USE_QKV_SPLIT_GATE_DEINTERLEAVE", "False").lower() in
+                 ("true", "1")),
+    # Fused gated RMSNorm that consumes the [L, num_v, head_v] strided z view
+    # directly (hcu_rms_norm_gated_strided_z) instead of materializing a
+    # contiguous copy first. Requires VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_USE_CUSTOM_STRIDED_Z":
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_STRIDED_Z", "True").lower() in
+                 ("true", "1")),
+    # Fused q/k/v split + contiguous for GatedDeltaNet rearrange_mixed_qkv
+    # (hcu_rearrange_mixed_qkv). Requires VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV":
+        lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_REARRANGE_MIXED_QKV", "True").lower() in
+                 ("true", "1")),
+    # HIP C++ packed decode kernel for GDN non-spec decode
+    # (aiter.aiter_fused_recurrent_gated_delta_rule_packed_decode);
+    # requires VLLM_HCU_USE_CUSTOM_OPS. Set to 0 to fall back to aiter Triton.
+    "VLLM_HCU_USE_AITER_PACKED_DECODE":
+        lambda: (os.environ.get(
+            "VLLM_HCU_USE_AITER_PACKED_DECODE", "True"
+        ).lower() in ("true", "1")),
 }
 
 # end-env-vars-definition

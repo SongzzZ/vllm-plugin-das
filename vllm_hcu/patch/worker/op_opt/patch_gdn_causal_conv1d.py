@@ -112,6 +112,13 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_causal_update(*args, **kwargs):
         bound = causal_update_signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        # MTP spec metadata can pass a strided index view; the custom
+        # causal-conv1d kernel requires unit stride in dim 0.
+        conv_state_indices = bound.arguments.get("conv_state_indices")
+        if conv_state_indices is not None and conv_state_indices.stride(0) != 1:
+            bound.arguments["conv_state_indices"] = (
+                conv_state_indices.contiguous()
+            )
         if use_nn_layout():
             x = bound.arguments["x"]
             conv_state = bound.arguments["conv_state"]

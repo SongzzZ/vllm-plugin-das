@@ -73,6 +73,14 @@ _ATTENTION: tuple[_Entry, ...] = (
     ),
 )
 
+_MODEL_OPT: tuple[_Entry, ...] = (
+    (
+        "module_exchange.quantization.modelopt",
+        "vllm.model_executor.layers.quantization.modelopt",
+        "vllm_hcu.model_executor.layers.quantization.modelopt",
+    ),
+)
+
 _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
     _MODULAR_KERNEL,
     _BASE_LINEAR,
@@ -81,6 +89,7 @@ _ALL_GROUPS: tuple[tuple[_Entry, ...], ...] = (
     _ATTENTION,
     _DEEPSEEK_V4,
     _DEEP_GEMM,
+    _MODEL_OPT,
 )
 
 _HCU_PACKAGE_ROOT = Path(__file__).resolve().parents[1]

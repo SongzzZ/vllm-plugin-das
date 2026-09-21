@@ -267,6 +267,17 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_w8a8_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_moe_wna16")),
+    # Ported from vllm-hcu-main c550526 / 7d48d04 / 3d26cca / dffd974 / 02ec8ce.
+    # patch_qwen_gdn_ops must stay after patch_gdn_rms_norm_gated: it wraps
+    # the RMSNormGated binding that the earlier adapter installs.
+    _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_fused")),
+    _CallbackSpec(_adapter("op_opt", "patch_fused_topk_router")),
+    _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a16_hcu")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen2_moe")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen_gdn_ops")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen3_next_model")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen3_next_packed_decode")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen_gdn_static")),
 )
 
 
