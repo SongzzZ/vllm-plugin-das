@@ -10,6 +10,14 @@
 # stock aiter-Triton import), so the call site picks the HIP kernel through
 # ordinary global lookup.  The two kernels share one signature, and the call
 # site passes keyword arguments only.
+#
+# vLLM build variants:
+# - symbol bound (stock import succeeded): wrap and dispatch as above;
+# - symbol unbound but the call site exists (stock import failed): install
+#   the dispatcher as the missing global; the Triton fallback resolves
+#   lazily so the stock path still works;
+# - neither (builds without the packed-decode path at all, e.g. the
+#   das185 nightly): leave the module untouched.
 
 from __future__ import annotations
 
@@ -19,7 +27,6 @@ from types import ModuleType
 from ._common import (
     PatchCompatibilityError,
     load_exact_module,
-    require_callable,
     require_unpatched,
 )
 
@@ -49,6 +56,23 @@ def _resolve_hip_kernel():
     return _hip_fn
 
 
+def _load_fallback():
+    """Resolve the stock Triton fallback the same way the stock import does."""
+    try:
+        from aiter.ops.triton.fla.fused_recurrent import (
+            fused_recurrent_gated_delta_rule_packed_decode as fn,
+        )
+
+        return fn
+    except ImportError:
+        pass
+    from vllm.model_executor.layers.fla.ops import (
+        fused_recurrent_gated_delta_rule_packed_decode as fn,
+    )
+
+    return fn
+
+
 def apply_to_module(module: ModuleType) -> bool:
     models = load_exact_module(TARGET_MODULE, module)
     if getattr(models, _MARKER, False):
@@ -60,19 +84,32 @@ def apply_to_module(module: ModuleType) -> bool:
                 "restart the process"
             )
         return False
-    original = require_unpatched(
-        models,
-        "fused_recurrent_gated_delta_rule_packed_decode",
-        TARGETS[0],
-        _WRAPPER,
-    )
-    require_callable(
-        models,
-        "fused_recurrent_gated_delta_rule_packed_decode",
-        TARGETS[0],
-    )
 
-    @functools.wraps(original)
+    original = getattr(
+        models, "fused_recurrent_gated_delta_rule_packed_decode", None
+    )
+    if original is None:
+        import inspect
+
+        try:
+            has_call_site = (
+                "fused_recurrent_gated_delta_rule_packed_decode"
+                in inspect.getsource(models)
+            )
+        except (OSError, TypeError):
+            has_call_site = False
+        if not has_call_site:
+            # Build without the packed-decode path: nothing to dispatch.
+            return False
+
+    if original is not None:
+        original = require_unpatched(
+            models,
+            "fused_recurrent_gated_delta_rule_packed_decode",
+            TARGETS[0],
+            _WRAPPER,
+        )
+
     def hcu_packed_decode(*args, **kwargs):
         import vllm_hcu.platforms.envs as henvs
 
@@ -83,8 +120,13 @@ def apply_to_module(module: ModuleType) -> bool:
             and hip_kernel is not None
         ):
             return hip_kernel(*args, **kwargs)
-        return original(*args, **kwargs)
+        fallback = original
+        if fallback is None:
+            fallback = _load_fallback()
+        return fallback(*args, **kwargs)
 
+    if original is not None:
+        functools.update_wrapper(hcu_packed_decode, original)
     setattr(hcu_packed_decode, _WRAPPER, True)
     models._vllm_hcu_original_packed_decode = original
     models.fused_recurrent_gated_delta_rule_packed_decode = hcu_packed_decode
