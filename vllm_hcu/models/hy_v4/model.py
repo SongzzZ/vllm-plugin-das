@@ -77,12 +77,15 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+import vllm_hcu.platforms.envs as henvs
+
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
     require_local_indexer_producer,
 )
+from .fp8_kv_dequant import LightOpKVReuseState
 from .hc import HYV4HCHeadLayer, HYV4HCLayer
 from .moe import HYV4FeedForward, HYV4MoEFused
 
@@ -91,6 +94,16 @@ logger = init_logger(__name__)
 HYV4_PACKED_MODULES_MAPPING = {
     "gate_up_proj": ["gate_proj", "up_proj"],
 }
+
+
+def enable_hyv4_gate_a2a_overlap(vllm_config: VllmConfig) -> bool:
+    """Return whether HY V4 may overlap g_proj with DCP A2A."""
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        henvs.VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP
+        and parallel_config.decode_context_parallel_size > 1
+        and parallel_config.dcp_comm_backend == "a2a"
+    )
 
 
 def _is_modelopt_layer_excluded(
@@ -348,6 +361,8 @@ class HYV4DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
+        gate_a2a_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -373,6 +388,8 @@ class HYV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             layer_idx=layer_idx,
             topk_indices_buffer=topk_indices_buffer,
+            lightop_kv_reuse_state=lightop_kv_reuse_state,
+            gate_a2a_stream=gate_a2a_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
@@ -479,11 +496,25 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 dtype=torch.int32,
                 device=self.device,
             )
+            self.lightop_kv_reuse_state = (
+                LightOpKVReuseState.from_topk_buffer(self.topk_indices_buffer)
+                if henvs.VLLM_HCU_HYV4_FP8_KV_DEQUANT
+                else None
+            )
         else:
             self.topk_indices_buffer = None
+            self.lightop_kv_reuse_state = None
         self.config = config
         self.quant_config = quant_config
         self.enable_ihc = getattr(config, "enable_ihc", False)
+        self.gate_a2a_stream = (
+            torch.cuda.Stream()
+            if getattr(config, "gated_mla", False)
+            and enable_hyv4_gate_a2a_overlap(vllm_config)
+            else None
+        )
+        if self.gate_a2a_stream is not None:
+            logger.info("HY V4 gated-MLA g_proj/DCP A2A overlap enabled")
 
         if get_pp_group().is_first_rank or (
             self.config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -505,6 +536,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 quant_config=quant_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                lightop_kv_reuse_state=self.lightop_kv_reuse_state,
+                gate_a2a_stream=self.gate_a2a_stream,
             ),
             prefix=f"{prefix}.layers",
         )

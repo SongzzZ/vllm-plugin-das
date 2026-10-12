@@ -7,7 +7,8 @@ sparse backend forwards the per-head learnable sink through both prefill and
 decode without changing backend behavior for other models.
 """
 
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 import os
 from typing import cast
 
@@ -15,20 +16,26 @@ import regex as re
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.nn.parameter import Parameter
 from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import (
+    divide,
+    get_dcp_group,
     get_pcp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
+    WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -40,6 +47,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -49,9 +57,16 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, get_kv_quant_mode
 
+from .fp8_kv_dequant import LightOpKVReuseState
+
 logger = init_logger(__name__)
 
-_SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
+_SPARSE_LAYER_TYPES = (
+    "sparse_attention",
+    "sparse",
+    "deepseek_sparse_attention",
+    "indexed_attention",
+)
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -388,6 +403,41 @@ class Indexer(nn.Module):
 class HYV4MLAAttentionLayer(MLAAttention):
     """Attach the quantization mode omitted by vLLM 0.25.1 MLA specs."""
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """Prepare MLA projections, then run the selected backend's hook."""
+        super().process_weights_after_loading(act_dtype)
+        if getattr(self, "_hcu_dcp_q_replicate", False):
+            if (
+                self.is_aiter_triton_fp4_bmm_enabled
+                or self.is_aiter_triton_fp8_bmm_enabled
+            ):
+                raise RuntimeError(
+                    "VLLM_DCP_Q_REPLICATE does not support Aiter MLA BMM "
+                    "weight formats on vLLM 0.25.1"
+                )
+            self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
+                self.W_UK_T.contiguous(), dim=0
+            )
+        self.impl.process_weights_after_loading(act_dtype)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output_shape: torch.Size | None = None,
+        q_dcp_replicated: torch.Tensor | None = None,
+        dcp_a2a_overlap_fn: Callable[[], None] | None = None,
+    ) -> torch.Tensor:
+        """Forward local Q while exposing group-replicated Q to decode."""
+        self._hcu_q_dcp_replicated = q_dcp_replicated
+        self._hcu_dcp_a2a_overlap_fn = dcp_a2a_overlap_fn
+        try:
+            return super().forward(q, kv_c_normed, k_pe, output_shape)
+        finally:
+            self._hcu_q_dcp_replicated = None
+            self._hcu_dcp_a2a_overlap_fn = None
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         return replace(
@@ -396,10 +446,154 @@ class HYV4MLAAttentionLayer(MLAAttention):
         )
 
 _LINEAR_GATE_PCP_SHARD_ENV = "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD"
-_LINEAR_GATE_PCP_CHUNK_ENV = "VLLM_HCU_LINEAR_GATE_PCP_CHUNKING"
-_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV = "VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS"
-_LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS = 4096
+_LINEAR_GATE_PCP_GROUP_SIZE_ENV = "VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE"
+_LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE = 2
 _linear_gate_pcp_shard_logged = False
+# Keyed by (parent PCP identity, nested subgroup ranks). Flat rank tuples collide
+# across different GROUP_SIZE partitions of the same PCP world.
+_linear_gate_pcp_groups: dict[tuple, object] = {}
+_linear_gate_pcp_cache_parent: object | None = None
+_LINEAR_GATE_ALLOWED_GROUP_SIZES = (2, 4, 8)
+
+_DCP_Q_REPLICATE_ENV = "VLLM_DCP_Q_REPLICATE"
+
+
+@dataclass(frozen=True)
+class DCPQReplicationTopology:
+    """Effective TP topology used by an official-style DCP Q projection."""
+
+    group_size: int
+    rank_in_group: int
+    tp_rank: int
+    tp_world_size: int
+
+
+def resolve_dcp_q_replication_topology(
+    *,
+    tp_rank: int,
+    tp_world_size: int,
+    dcp_world_size: int,
+) -> DCPQReplicationTopology:
+    """Map a TP rank to the coarser shard shared by its DCP group."""
+    group_size = max(int(dcp_world_size), 1)
+    if tp_world_size % group_size != 0:
+        raise ValueError(
+            "DCP Q replication requires tensor_parallel_size to be divisible "
+            f"by decode_context_parallel_size; got TP={tp_world_size}, "
+            f"DCP={group_size}"
+        )
+    return DCPQReplicationTopology(
+        group_size=group_size,
+        rank_in_group=tp_rank % group_size,
+        tp_rank=tp_rank // group_size,
+        tp_world_size=tp_world_size // group_size,
+    )
+
+
+def dcp_q_replication_enabled() -> bool:
+    """Return the official vLLM DCP query-replication opt-in."""
+    return _env_flag(_DCP_Q_REPLICATE_ENV, False)
+
+
+class DCPGroupColumnParallelLinear(ColumnParallelLinear):
+    """Shard a Q projection across DCP groups and replicate within a group.
+
+    vLLM 0.25.1 does not yet let ``ColumnParallelLinear`` override its TP
+    rank and world size. This is the equivalent of upstream's newer
+    ``DCPGroupColumnParallelLinear`` adapted to the 0.25.1 constructor.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        gather_output: bool = False,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        return_bias: bool = True,
+    ) -> None:
+        parallel_config = get_current_vllm_config().parallel_config
+        topology = resolve_dcp_q_replication_topology(
+            tp_rank=get_tensor_model_parallel_rank(),
+            tp_world_size=get_tensor_model_parallel_world_size(),
+            dcp_world_size=parallel_config.decode_context_parallel_size,
+        )
+        self.group_size = topology.group_size
+        self.rank_in_group = topology.rank_in_group
+        self.qrep_active = self.group_size > 1
+
+        self.input_size_per_partition = input_size
+        self.output_size_per_partition = divide(
+            output_size, topology.tp_world_size
+        )
+        self.output_partition_sizes = [self.output_size_per_partition]
+
+        # LinearBase resolves the quant method before weights are created.
+        # Restore the coarse TP coordinates immediately afterward so both
+        # legacy and v2 parameter loaders select the DCP-group shard.
+        LinearBase.__init__(
+            self,
+            input_size,
+            output_size,
+            bias,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
+            return_bias=return_bias,
+            disable_tp=True,
+        )
+        self.disable_tp = False
+        self.tp_rank = topology.tp_rank
+        self.tp_size = topology.tp_world_size
+        self._maybe_allow_fp8_block_shape_mismatch()
+        self.gather_output = gather_output
+        self.quant_method.create_weights(
+            layer=self,
+            input_size_per_partition=self.input_size_per_partition,
+            output_partition_sizes=self.output_partition_sizes,
+            input_size=self.input_size,
+            output_size=self.output_size,
+            params_dtype=self.params_dtype,
+            weight_loader=(
+                self.weight_loader_v2
+                if self.quant_method.__class__.__name__
+                in WEIGHT_LOADER_V2_SUPPORTED
+                else self.weight_loader
+            ),
+        )
+        if bias:
+            self.bias = Parameter(
+                torch.empty(
+                    self.output_size_per_partition,
+                    dtype=self.params_dtype,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                self.bias,
+                {"output_dim": 0, "weight_loader": self.weight_loader},
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.update_param_tp_status()
+        # The HCU replacement for ColumnParallelLinear uses this stable
+        # class-name contract in both legacy and v2 weight loaders.
+        self.is_quantization = (
+            self.quant_method.__class__.__name__ != "UnquantizedLinearMethod"
+        )
+
+    def _local_view(self, out: torch.Tensor) -> torch.Tensor:
+        """Select this rank's original TP head shard from group-wide Q."""
+        if self.group_size == 1:
+            return out
+        local_heads = divide(out.shape[-2], self.group_size)
+        start = self.rank_in_group * local_heads
+        return out[..., start : start + local_heads, :].contiguous()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -417,44 +611,145 @@ def linear_gate_pcp_shard_enabled() -> bool:
     return _env_flag(_LINEAR_GATE_PCP_SHARD_ENV, False)
 
 
-def linear_gate_pcp_chunking_enabled() -> bool:
-    """Return whether large linear_gate PCP inputs should be chunked.
+def _linear_gate_pcp_group_size(pcp_size: int) -> int:
+    """Return the PCP subgroup size that shares one K-sharded linear_gate.
 
-    Chunking defaults to disabled. Set
-    ``VLLM_HCU_LINEAR_GATE_PCP_CHUNKING=1`` to enable chunked collectives.
+    Unset ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` defaults to
+    ``_LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE`` (2). When set, the value must be
+    2, 4, or 8 and must divide ``pcp_size``.
     """
-    return _env_flag(_LINEAR_GATE_PCP_CHUNK_ENV, False)
-
-
-def linear_gate_pcp_block_tokens() -> int:
-    """Return the positive local-token block size for linear_gate PCP."""
-    raw_value = os.environ.get(
-        _LINEAR_GATE_PCP_BLOCK_TOKENS_ENV,
-        str(_LINEAR_GATE_PCP_DEFAULT_BLOCK_TOKENS),
-    ).strip()
-    try:
-        block_tokens = int(raw_value)
-    except ValueError as exc:
+    raw = os.environ.get(_LINEAR_GATE_PCP_GROUP_SIZE_ENV)
+    if raw is None or raw.strip() == "":
+        size = _LINEAR_GATE_PCP_DEFAULT_GROUP_SIZE
+    else:
+        try:
+            size = int(raw.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {raw!r}."
+            ) from exc
+    if size not in _LINEAR_GATE_ALLOWED_GROUP_SIZES:
         raise ValueError(
-            f"{_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV} must be a positive integer; "
-            f"got {raw_value!r}."
-        ) from exc
-    if block_tokens <= 0:
-        raise ValueError(
-            f"{_LINEAR_GATE_PCP_BLOCK_TOKENS_ENV} must be a positive integer; "
-            f"got {block_tokens}."
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV} must be 2, 4, or 8; got {size}."
         )
-    return block_tokens
+    if pcp_size % size != 0:
+        raise ValueError(
+            f"PCP size {pcp_size} is not divisible by "
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV}={size}."
+        )
+    return size
+
+
+def _linear_gate_pcp_group_ranks(
+    world: int,
+    dp_size: int,
+    pp_size: int,
+    pcp_size: int,
+    tp_size: int,
+    group_size: int,
+) -> list[list[int]]:
+    """Split each PCP group into K-shard subgroups of ``group_size`` ranks."""
+    coordinates = dp_size * pp_size * pcp_size * tp_size
+    if world % coordinates != 0:
+        raise RuntimeError(
+            "unable to derive PCP linear_gate subgroup topology: "
+            f"world={world}, dp={dp_size}, pp={pp_size}, pcp={pcp_size}, "
+            f"tp={tp_size}."
+        )
+    if pcp_size % group_size != 0:
+        raise ValueError(
+            f"PCP size {pcp_size} is not divisible by group size {group_size}."
+        )
+    # Layout matches vLLM: ExternalDP x DP x PP x PCP x TP.
+    ranks = torch.arange(world).reshape(-1, dp_size, pp_size, pcp_size, tp_size)
+    groups = ranks.transpose(3, 4).reshape(-1, pcp_size)
+    return [
+        chunk.tolist() for row in groups for chunk in row.reshape(-1, group_size)
+    ]
+
+
+def _linear_gate_pcp_subgroup_cache_key(
+    pcp: object,
+    group_ranks: list[list[int]],
+) -> tuple:
+    """Build a cache key that keeps subgroup boundaries and parent PCP identity.
+
+    Flattening ranks alone collides across GROUP_SIZE values that cover the same
+    rank set (e.g. PCP=8 group=2 vs group=4 both flatten to 0..7).
+    """
+    return (
+        id(pcp),
+        getattr(pcp, "unique_name", None),
+        tuple(tuple(ranks) for ranks in group_ranks),
+    )
+
+
+def clear_linear_gate_pcp_groups() -> None:
+    """Drop cached linear_gate PCP subgroups after destroy/reinit."""
+    global _linear_gate_pcp_cache_parent
+    _linear_gate_pcp_groups.clear()
+    _linear_gate_pcp_cache_parent = None
+
+
+def _get_linear_gate_pcp_group():
+    """Return the PCP subgroup that K-shards one replica of linear_gate.
+
+    ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` splits the PCP group into independent
+    replicas (default 2). For PCP=32 and group size 8, ranks ``[0,8)``, ``[8,16)``,
+    ``[16,24)``, and ``[24,32)`` each shard the same full weight and run
+    all-to-all plus reduce-scatter inside the subgroup.
+    """
+    global _linear_gate_pcp_cache_parent
+    pcp = get_pcp_group()
+    size = _linear_gate_pcp_group_size(pcp.world_size)
+    if pcp.world_size <= 1:
+        raise ValueError(
+            "linear_gate PCP sharding requires prefill_context_parallel_size > 1; "
+            f"got pcp_size={pcp.world_size}. Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+        )
+    if pcp.world_size % size != 0:
+        raise ValueError(
+            f"PCP size {pcp.world_size} is not divisible by "
+            f"{_LINEAR_GATE_PCP_GROUP_SIZE_ENV}={size}."
+        )
+    if size == pcp.world_size:
+        return pcp
+    # Parent PCP GroupCoordinator was replaced (destroy/reinit); drop stale
+    # subgroups so we never reuse a destroyed device_group.
+    if _linear_gate_pcp_cache_parent is not pcp:
+        _linear_gate_pcp_groups.clear()
+        _linear_gate_pcp_cache_parent = pcp
+    parallel = get_current_vllm_config().parallel_config
+    group_ranks = _linear_gate_pcp_group_ranks(
+        dist.get_world_size(),
+        parallel.data_parallel_size,
+        parallel.pipeline_parallel_size,
+        pcp.world_size,
+        get_tensor_model_parallel_world_size(),
+        size,
+    )
+    key = _linear_gate_pcp_subgroup_cache_key(pcp, group_ranks)
+    if key not in _linear_gate_pcp_groups:
+        from vllm.distributed.parallel_state import init_model_parallel_group
+
+        _linear_gate_pcp_groups[key] = init_model_parallel_group(
+            group_ranks,
+            pcp.local_rank,
+            pcp.torch_distributed_backend,
+            group_name="hy_v4_linear_gate_pcp",
+        )
+    return _linear_gate_pcp_groups[key]
 
 
 class PCPShardedGateLinear(ColumnParallelLinear):
-    """PCP-shard ``linear_gate`` using K sharding.
+    """PCP-shard ``linear_gate`` using K sharding inside a PCP subgroup.
 
-    ``k_shard`` slices the weight input dimension. An all-to-all sends each
-    destination rank its K slice for every token, producing
-    ``[global_tokens, K/PCP]`` before a partial GEMM and token reduce-scatter.
-    reduce-scatter is the fused equivalent of all-reduce followed by
-    redistribution to each token-owning PCP rank.
+    ``VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE`` selects the subgroup (default 2).
+    ``k_shard`` slices the weight input dimension across that subgroup. An
+    all-to-all sends each destination rank its K slice for every token,
+    producing ``[group_tokens, K/group]`` before a partial GEMM and token
+    reduce-scatter. reduce-scatter is the fused equivalent of all-reduce
+    followed by redistribution to each token-owning rank in the subgroup.
     """
 
     def __init__(
@@ -465,7 +760,8 @@ class PCPShardedGateLinear(ColumnParallelLinear):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        pcp_group = get_pcp_group()
+        pcp_group = _get_linear_gate_pcp_group()
+        self.pcp_group = pcp_group
         self.pcp_rank = pcp_group.rank_in_group
         self.pcp_size = pcp_group.world_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -477,14 +773,14 @@ class PCPShardedGateLinear(ColumnParallelLinear):
             )
         if self.pcp_size <= 1:
             raise ValueError(
-                "linear_gate PCP sharding requires prefill_context_parallel_size > 1; got "
-                f"pcp_size={self.pcp_size}. Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
+                "linear_gate PCP sharding requires a PCP subgroup size > 1; "
+                f"got group_size={self.pcp_size}. Unset {_LINEAR_GATE_PCP_SHARD_ENV}."
             )
         shard_dim = input_size
         if shard_dim % self.pcp_size != 0:
             raise ValueError(
                 f"linear_gate k_shard dimension {shard_dim} is not divisible "
-                f"by pcp_size {self.pcp_size}."
+                f"by PCP group size {self.pcp_size}."
             )
         self.gate_full_input_size = input_size
         self.gate_output_size = output_size
@@ -517,7 +813,7 @@ class PCPShardedGateLinear(ColumnParallelLinear):
         if not _linear_gate_pcp_shard_logged:
             _linear_gate_pcp_shard_logged = True
             logger.info(
-                "HY V4 linear_gate PCP K sharding enabled: PCP=%d, "
+                "HY V4 linear_gate PCP K sharding enabled: group=%d, "
                 "full weight=[%d, %d], local weight=[%d, %d].",
                 self.pcp_size,
                 self.gate_output_size,
@@ -567,62 +863,25 @@ class PCPShardedGateLinear(ColumnParallelLinear):
         return hidden.narrow(-1, start, self.gate_shard_input_size).contiguous()
 
     def _forward_k_shard(self, input_: torch.Tensor) -> torch.Tensor:
-        pcp_group = get_pcp_group()
+        pcp_group = self.pcp_group
         local_tokens = input_.shape[0]
-        chunking_enabled = linear_gate_pcp_chunking_enabled()
-        block_tokens = linear_gate_pcp_block_tokens() if chunking_enabled else local_tokens
-        if chunking_enabled and local_tokens > block_tokens:
-            output = None
-            for start in range(0, local_tokens, block_tokens):
-                end = min(start + block_tokens, local_tokens)
-                current_tokens = end - start
-                # For destination rank r, send K slice r of this rank-local token
-                # block. The receive layout is source-rank-major global token order.
-                send = input_[start:end].reshape(
-                    current_tokens, self.pcp_size, self.gate_shard_input_size
-                ).transpose(0, 1).contiguous()
-                received = torch.empty_like(send)
-                dist.all_to_all_single(
-                    received.view(-1),
-                    send.view(-1),
-                    group=pcp_group.device_group,
-                )
-                partial = self._linear(
-                    received.view(
-                        self.pcp_size * current_tokens,
-                        self.gate_shard_input_size,
-                    )
-                )
-                # Equivalent to all-reduce(partial) followed by selecting this
-                # rank's token rows. Blocking bounds the unreduced gate activation.
-                block_output = pcp_group.reduce_scatter(partial.contiguous(), dim=0)
-                if output is None:
-                    output = block_output.new_empty(
-                        (local_tokens, self.gate_output_size)
-                    )
-                output[start:end].copy_(block_output)
-
-            if output is None:
-                return input_.new_empty((0, self.gate_output_size))
-            return output
-        else:
-            # For destination rank r, send K slice r of every local token. The
-            # receive layout is source-rank-major, which is global token order.
-            send = input_.reshape(
-                local_tokens, self.pcp_size, self.gate_shard_input_size
-            ).transpose(0, 1).contiguous()
-            received = torch.empty_like(send)
-            dist.all_to_all_single(
-                received.view(-1),
-                send.view(-1),
-                group=pcp_group.device_group,
-            )
-            partial = self._linear(
-                received.view(self.pcp_size * local_tokens, self.gate_shard_input_size)
-            )
-            # Equivalent to all-reduce(partial) followed by selecting this rank's
-            # token rows, but avoids materializing the full reduced output.
-            return pcp_group.reduce_scatter(partial.contiguous(), dim=0)
+        # For destination rank r, send K slice r of every local token. The
+        # receive layout is source-rank-major, which is subgroup token order.
+        send = input_.reshape(
+            local_tokens, self.pcp_size, self.gate_shard_input_size
+        ).transpose(0, 1).contiguous()
+        received = torch.empty_like(send)
+        dist.all_to_all_single(
+            received.view(-1),
+            send.view(-1),
+            group=pcp_group.device_group,
+        )
+        partial = self._linear(
+            received.view(self.pcp_size * local_tokens, self.gate_shard_input_size)
+        )
+        # Equivalent to all-reduce(partial) followed by selecting this rank's
+        # token rows, but avoids materializing the full reduced output.
+        return pcp_group.reduce_scatter(partial.contiguous(), dim=0)
 
     def forward(self, input_):
         output = self._forward_k_shard(input_)
@@ -658,6 +917,8 @@ class HYV4MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
+        lightop_kv_reuse_state: LightOpKVReuseState | None = None,
+        gate_a2a_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -762,9 +1023,14 @@ class HYV4MLAAttention(nn.Module):
         self.q_a_layernorm = None
         self.q_b_proj = None
         self.q_proj = None
+        q_proj_cls = (
+            DCPGroupColumnParallelLinear
+            if dcp_q_replication_enabled()
+            else ColumnParallelLinear
+        )
         if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj = q_proj_cls(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -772,7 +1038,7 @@ class HYV4MLAAttention(nn.Module):
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj = q_proj_cls(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -883,6 +1149,8 @@ class HYV4MLAAttention(nn.Module):
                 _require_sparse_mqa_backend(sink_backend)
 
         extra_impl_args = {} if sinks is None else {"sinks": sinks}
+        if self.is_sparse and lightop_kv_reuse_state is not None:
+            extra_impl_args["lightop_kv_reuse_state"] = lightop_kv_reuse_state
         self.mla_attn = HYV4MLAAttentionLayer(
             num_heads=self.num_local_heads,
             scale=self.scaling,
@@ -901,6 +1169,23 @@ class HYV4MLAAttention(nn.Module):
             attn_backend=sink_backend,
             **extra_impl_args,
         )
+        q_proj_layer = self.q_b_proj if self.q_b_proj is not None else self.q_proj
+        self.dcp_q_replicate = bool(
+            getattr(q_proj_layer, "qrep_active", False)
+        )
+        self.mla_attn._hcu_dcp_q_replicate = self.dcp_q_replicate
+        self.gate_a2a_stream = gate_a2a_stream
+        self.gate_a2a_start_event = (
+            torch.cuda.Event() if gate_a2a_stream is not None else None
+        )
+        self.gate_a2a_done_event = (
+            torch.cuda.Event() if gate_a2a_stream is not None else None
+        )
+        self.mla_attn._hcu_dcp_a2a_overlap_stream = gate_a2a_stream
+        self.mla_attn._hcu_dcp_a2a_overlap_start_event = (
+            self.gate_a2a_start_event
+        )
+        self.mla_attn._hcu_dcp_a2a_overlap_done_event = self.gate_a2a_done_event
 
     def _resolve_sink_backend(
         self, kv_cache_dtype: str
@@ -973,17 +1258,22 @@ class HYV4MLAAttention(nn.Module):
             assert self.q_b_proj is not None
             q_c = self.q_a_proj(hidden_states)[0]
             q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            q_proj_layer = self.q_b_proj
+            q = q_proj_layer(q_c)[0]
         else:
             assert self.q_proj is not None
-            q = self.q_proj(hidden_states)[0]
+            q_proj_layer = self.q_proj
+            q = q_proj_layer(hidden_states)[0]
 
         assert self.kv_a_proj_with_mqa is not None
         kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        q_heads = self.num_local_heads
+        if self.dcp_q_replicate:
+            q_heads *= q_proj_layer.group_size
+        q = q.view(-1, q_heads, self.qk_head_dim)
         # Add a head dim of 1 to k_pe.
         k_pe = k_pe.unsqueeze(1)
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
@@ -992,6 +1282,10 @@ class HYV4MLAAttention(nn.Module):
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling
+
+        q_dcp_replicated = None
+        if self.dcp_q_replicate:
+            q_dcp_replicated, q = q, q_proj_layer._local_view(q)
 
         output_shape = (
             hidden_states.shape[0],
@@ -1005,10 +1299,21 @@ class HYV4MLAAttention(nn.Module):
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
         self._indexer_and_attn(
-            hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
+            hidden_states,
+            q_c,
+            positions,
+            q,
+            kv_c_normed,
+            k_pe,
+            attn_out,
+            q_dcp_replicated,
         )
 
-        if self.gated_mla and self.linear_gate is not None:
+        if (
+            self.gated_mla
+            and self.linear_gate is not None
+            and self.gate_a2a_stream is None
+        ):
             gate_score = self.linear_gate(hidden_states)[0]
             if self.config.gating_type == "headwise":
                 gate_score = gate_score.unsqueeze(-1)
@@ -1031,6 +1336,7 @@ class HYV4MLAAttention(nn.Module):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, heads * v_head_dim], written in place
+        q_dcp_replicated: torch.Tensor | None = None,
     ) -> None:
         """Run the lightning indexer and MLA attention in one eager segment.
 
@@ -1043,18 +1349,60 @@ class HYV4MLAAttention(nn.Module):
         """
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        if self.gate_a2a_stream is None:
+            out.copy_(
+                self.mla_attn(
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    output_shape=out.shape,
+                    q_dcp_replicated=q_dcp_replicated,
+                )
+            )
+            return
+
+        assert self.linear_gate is not None
+        gate_scores: list[torch.Tensor] = []
+
+        def compute_gate() -> None:
+            gate_scores.append(self.linear_gate(hidden_states)[0])
+
         out.copy_(
             self.mla_attn(
                 q,
                 kv_c_normed,
                 k_pe,
                 output_shape=out.shape,
+                q_dcp_replicated=q_dcp_replicated,
+                dcp_a2a_overlap_fn=compute_gate,
             )
         )
+        # Dummy/profile forwards may have no live DCP metadata and therefore
+        # never enter the A2A call site. Preserve correctness in that case.
+        if not gate_scores:
+            compute_gate()
+        gate_score = gate_scores[0]
+        gate_score.record_stream(torch.cuda.current_stream())
+        self._apply_gate_in_place(out, gate_score)
+
+    def _apply_gate_in_place(
+        self, attn_out: torch.Tensor, gate_score: torch.Tensor
+    ) -> None:
+        if self.config.gating_type == "headwise":
+            gate_score = gate_score.unsqueeze(-1)
+            attn_view = attn_out.reshape(
+                *attn_out.shape[:-1], -1, self.v_head_dim
+            )
+            attn_view.mul_(torch.sigmoid(gate_score))
+        else:
+            attn_out.mul_(torch.sigmoid(gate_score))
 
 
 __all__ = [
     "HYV4MLAAttention",
+    "DCPGroupColumnParallelLinear",
+    "dcp_q_replication_enabled",
+    "resolve_dcp_q_replication_topology",
     "Indexer",
     "compute_skip_topk_layers",
     "is_skip_topk_indexer_weight",
